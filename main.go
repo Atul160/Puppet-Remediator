@@ -38,12 +38,13 @@ type ResponseResult struct {
 
 // AppConfig holds environment variables
 type AppConfig struct {
-	SSHUser      string
-	SSHPasswords []string
-	WinUser      string
-	WinPassword  string
-	WinPort      int
-	Port         string
+	SSHUser       string
+	SSHPasswords  []string
+	WinUser       string
+	WinPassword   string
+	WinPort       int
+	Port          string
+	PuppetVersion string
 }
 
 var config AppConfig
@@ -80,6 +81,11 @@ func initConfig() {
 	config.Port = os.Getenv("PORT")
 	if config.Port == "" {
 		config.Port = "8080"
+	}
+
+	config.PuppetVersion = os.Getenv("PUPPET_VERSION")
+	if config.PuppetVersion == "" {
+		log.Println("PUPPET_VERSION not set. Version maintenance will be skipped.")
 	}
 }
 
@@ -205,6 +211,45 @@ func handleLinuxCheck(clientHost, caHost string) ResponseResult {
 	// Using the first password based returned index by ConnectWithRetries
 	activePwd := strings.TrimSpace(config.SSHPasswords[pwdIdx])
 
+	// VERSION MAINTAINER BLOCK
+	if config.PuppetVersion != "" {
+		log.Printf("[%s] Checking Puppet version. Desired: %s", clientHost, config.PuppetVersion)
+
+		verOut, err := sshClient.runSudoWithPassword("puppet --version", activePwd)
+		clientVersion := strings.TrimSpace(verOut)
+
+		if err == nil && clientVersion != "" && clientVersion != config.PuppetVersion {
+			log.Printf("[%s] Version mismatch! Current: %s. Attempting to install %s...", clientHost, clientVersion, config.PuppetVersion)
+
+			// Cross-platform install command (handles RedHat/CentOS and Debian/Ubuntu)
+			// Use a shell wrapper so shell constructs and substitutions work over sudo,
+			// and use dpkg -i with apt-get -f install fallback to resolve deps.
+			upgradeCmd := fmt.Sprintf(`bash -lc 'if command -v dpkg &> /dev/null; then
+	curl -s -o /tmp/puppet_agent.deb "https://packages.gametools.dev/artifactory/tk2-systems-tools-debs/pool/puppet-agent_%s-1$(lsb_release -sc)_amd64.deb" \
+	  && DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/puppet_agent.deb || DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+elif command -v yum &> /dev/null; then
+	yum install -y puppet-agent-%s
+else
+	echo "Unsupported package manager"
+	exit 1
+fi'`, config.PuppetVersion, config.PuppetVersion)
+
+			_, installErr := sshClient.runSudoWithPassword(upgradeCmd, activePwd)
+
+			if installErr != nil {
+				log.Printf("[%s] WARNING: Failed to maintain Puppet version: %v", clientHost, installErr)
+				result.Summary = "[Version fix failed]"
+			} else {
+				log.Printf("[%s] Successfully updated Puppet to %s", clientHost, config.PuppetVersion)
+				result.Summary = fmt.Sprintf("[Version enforced to %s] ", config.PuppetVersion)
+			}
+		} else if clientVersion == config.PuppetVersion {
+			log.Printf("[%s] Puppet version %s matches target state.", clientHost, clientVersion)
+		} else {
+			log.Printf("[%s] Could not detect current Puppet version. Skipping enforcement.", clientHost)
+		}
+	}
+
 	// 2. Run Diagnostic (Puppet Agent -t)
 	// Valid exit codes: 0 (No changes), 2 (Changes applied). Everything else is an error.
 	output, err := sshClient.runSudoWithPassword("puppet agent -t", activePwd)
@@ -219,6 +264,8 @@ func handleLinuxCheck(clientHost, caHost string) ResponseResult {
 			return result
 		}
 	}
+
+	log.Printf("[%s] Diagnostic complete. Exit Code: %d, Status: %s", clientHost, rc, result.Status) // LOGGING ADDED
 
 	if rc == 0 || rc == 2 {
 		result.Status = "SUCCESS"
@@ -268,6 +315,7 @@ func handleLinuxCheck(clientHost, caHost string) ResponseResult {
 	caActivePwd := strings.TrimSpace(config.SSHPasswords[capwdIdx])
 
 	// Clean commands on Master
+	caSSH.runSudoWithPassword(fmt.Sprintf("puppetserver ca revoke --certname %s", clientFQDN), caActivePwd)
 	caSSH.runSudoWithPassword(fmt.Sprintf("puppetserver ca clean --certname %s", clientFQDN), caActivePwd)
 
 	// D. ASYNC SIGNING PROCESS
@@ -328,6 +376,45 @@ func handleWindowsCheck(clientHost, caHost string) ResponseResult {
 	// Windows Puppet agent location varies, but usually in PATH.
 	// If not, use full path: '& "C:\Program Files\Puppet Labs\Puppet\bin\puppet.bat" agent -t'
 
+	if config.PuppetVersion != "" {
+		log.Printf("[%s] Checking Windows Puppet version. Desired: %s", clientHost, config.PuppetVersion)
+
+		verOut, err := runWindowsCommand(clientHost, "puppet --version")
+		clientVersion := strings.TrimSpace(verOut)
+
+		if err == nil && clientVersion != "" && clientVersion != config.PuppetVersion {
+			log.Printf("[%s] Version mismatch! Current: %s. Attempting to install MSI %s...", clientHost, clientVersion, config.PuppetVersion)
+
+			// Download MSI from Artifactory and install silently
+			// Note: Update the URL to match your exact Windows artifacts repository
+			upgradeCmd := fmt.Sprintf(`
+				$url = 'https://packages.gametools.dev/artifactory/tk2-systems-tools-windows/puppet-agent-%s-x64.msi';
+				$dest = 'C:\Windows\Temp\puppet_agent.msi';
+				Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing;
+				if (Test-Path $dest) {
+					Start-Process -FilePath 'msiexec.exe' -ArgumentList '/qn', '/i', $dest -Wait -NoNewWindow;
+					Remove-Item -Force $dest;
+				} else {
+					Write-Error 'Download failed'
+				}
+			`, config.PuppetVersion)
+
+			_, installErr := runWindowsCommand(clientHost, upgradeCmd)
+
+			if installErr != nil {
+				log.Printf("[%s] WARNING: Failed to maintain Puppet version: %v", clientHost, installErr)
+				result.Summary = "[Version fix failed]"
+			} else {
+				log.Printf("[%s] Successfully updated Puppet to %s", clientHost, config.PuppetVersion)
+				result.Summary = fmt.Sprintf("[Version enforced to %s] ", config.PuppetVersion)
+			}
+		} else if clientVersion == config.PuppetVersion {
+			log.Printf("[%s] Puppet version %s matches target state.", clientHost, clientVersion)
+		} else {
+			log.Printf("[%s] Could not detect current Puppet version. Skipping enforcement.", clientHost)
+		}
+	}
+
 	// We use PowerShell to wrap the call
 	cmdCheck := "puppet agent -t --color=false"
 	output, err := runWindowsCommand(clientHost, cmdCheck)
@@ -387,8 +474,9 @@ func handleWindowsCheck(clientHost, caHost string) ResponseResult {
 
 	// Clean commands on Master
 	// Assuming sudo password is the first one in list
-	activePwd := strings.TrimSpace(config.SSHPasswords[capwdIdx])
-	caSSH.runSudoWithPassword(fmt.Sprintf("puppetserver ca clean --certname %s", clientFQDN), activePwd)
+	caActivePwd := strings.TrimSpace(config.SSHPasswords[capwdIdx])
+	caSSH.runSudoWithPassword(fmt.Sprintf("puppetserver ca revoke --certname %s", clientFQDN), caActivePwd)
+	caSSH.runSudoWithPassword(fmt.Sprintf("puppetserver ca clean --certname %s", clientFQDN), caActivePwd)
 
 	// D. ASYNC SIGNING PROCESS
 	var wg sync.WaitGroup
@@ -411,7 +499,7 @@ func handleWindowsCheck(clientHost, caHost string) ResponseResult {
 		defer wg.Done()
 		time.Sleep(8 * time.Second) // Give Windows a bit more time to network negotiation
 		cmd := fmt.Sprintf("puppetserver ca sign --certname %s", clientFQDN)
-		out, _ := caSSH.runSudoWithPassword(cmd, activePwd)
+		out, _ := caSSH.runSudoWithPassword(cmd, caActivePwd)
 		masterChan <- out
 	}()
 
@@ -457,6 +545,8 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "os_type must be 'linux' or 'windows'"})
 			return
 		}
+
+		log.Printf("Received puppet remediation request for %d clients ", len(jsonPayload.Clients)) // LOGGING ADDED
 
 		// Parallel processing using Goroutines for multiple clients
 		// Limitation: Be careful with too many parallel SSH connections
