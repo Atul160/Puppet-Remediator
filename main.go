@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -173,6 +175,18 @@ func (s *SSHClient) runSudoWithPassword(cmd string, password string) (string, er
 // WINDOWS UTILITIES (WinRM)
 // ==========================
 
+// utf16leBytes encodes a string as UTF-16LE, the encoding PowerShell requires
+// for -EncodedCommand payloads.
+func utf16leBytes(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	buf := make([]byte, len(units)*2)
+	for i, u := range units {
+		buf[i*2] = byte(u)
+		buf[i*2+1] = byte(u >> 8)
+	}
+	return buf
+}
+
 func runWindowsCommand(host string, cmd string) (string, error) {
 	endpoint := winrm.NewEndpoint(host, config.WinPort, false, false, nil, nil, nil, 0)
 	client, err := winrm.NewClient(endpoint, config.WinUser, config.WinPassword)
@@ -211,6 +225,15 @@ func handleLinuxCheck(clientHost, caHost string) ResponseResult {
 	// Using the first password based returned index by ConnectWithRetries
 	activePwd := strings.TrimSpace(config.SSHPasswords[pwdIdx])
 
+	// Version-fix note is tracked separately and prepended to whatever summary
+	// is ultimately returned, since later steps overwrite result.Summary.
+	var versionNote string
+	defer func() {
+		if versionNote != "" {
+			result.Summary = versionNote + result.Summary
+		}
+	}()
+
 	// VERSION MAINTAINER BLOCK
 	if config.PuppetVersion != "" {
 		log.Printf("[%s] Checking Puppet version. Desired: %s", clientHost, config.PuppetVersion)
@@ -224,24 +247,37 @@ func handleLinuxCheck(clientHost, caHost string) ResponseResult {
 			// Cross-platform install command (handles RedHat/CentOS and Debian/Ubuntu)
 			// Use a shell wrapper so shell constructs and substitutions work over sudo,
 			// and use dpkg -i with apt-get -f install fallback to resolve deps.
-			upgradeCmd := fmt.Sprintf(`bash -lc 'if command -v dpkg &> /dev/null; then
-	curl -s -o /tmp/puppet_agent.deb "https://packages.gametools.dev/artifactory/tk2-systems-tools-debs/pool/puppet-agent_%s-1$(lsb_release -sc)_amd64.deb" \
-	  && DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/puppet_agent.deb || DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+			// `set -e` plus `curl --fail` ensures a failed download or install aborts
+			// with a nonzero exit code instead of silently falling through to apt-get -f
+			// install (which succeeds even when nothing was actually installed).
+			upgradeCmd := fmt.Sprintf(`bash -lc 'set -e
+if command -v dpkg &> /dev/null; then
+	curl -sS --fail -o /tmp/puppet_agent.deb "https://packages.gametools.dev/artifactory/tk2-systems-tools-debs/pool/puppet-agent_%s-1$(lsb_release -sc)_amd64.deb"
+	DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/puppet_agent.deb || DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+	dpkg -l puppet-agent | grep -q "^ii.*%s"
 elif command -v yum &> /dev/null; then
 	yum install -y puppet-agent-%s
 else
 	echo "Unsupported package manager"
 	exit 1
-fi'`, config.PuppetVersion, config.PuppetVersion)
+fi'`, config.PuppetVersion, config.PuppetVersion, config.PuppetVersion)
 
 			_, installErr := sshClient.runSudoWithPassword(upgradeCmd, activePwd)
 
+			// Re-verify the installed version rather than trusting the install
+			// command's exit code alone (a silent no-op could still exit 0).
+			postVerOut, postErr := sshClient.runSudoWithPassword("puppet --version", activePwd)
+			postVersion := strings.TrimSpace(postVerOut)
+
 			if installErr != nil {
-				log.Printf("[%s] WARNING: Failed to maintain Puppet version: %v", clientHost, installErr)
-				result.Summary = "[Version fix failed]"
+				log.Printf("[%s] WARNING: Failed to install Puppet %s: %v", clientHost, config.PuppetVersion, installErr)
+				versionNote = "[Version fix failed] "
+			} else if postErr != nil || postVersion != config.PuppetVersion {
+				log.Printf("[%s] WARNING: Install command succeeded but version is still %q, expected %q", clientHost, postVersion, config.PuppetVersion)
+				versionNote = "[Version fix failed: post-install check mismatch] "
 			} else {
 				log.Printf("[%s] Successfully updated Puppet to %s", clientHost, config.PuppetVersion)
-				result.Summary = fmt.Sprintf("[Version enforced to %s] ", config.PuppetVersion)
+				versionNote = fmt.Sprintf("[Version enforced to %s] ", config.PuppetVersion)
 			}
 		} else if clientVersion == config.PuppetVersion {
 			log.Printf("[%s] Puppet version %s matches target state.", clientHost, clientVersion)
@@ -372,6 +408,15 @@ fi'`, config.PuppetVersion, config.PuppetVersion)
 func handleWindowsCheck(clientHost, caHost string) ResponseResult {
 	result := ResponseResult{Client: clientHost, Status: "UNKNOWN"}
 
+	// Version-fix note is tracked separately and prepended to whatever summary
+	// is ultimately returned, since later steps overwrite result.Summary.
+	var versionNote string
+	defer func() {
+		if versionNote != "" {
+			result.Summary = versionNote + result.Summary
+		}
+	}()
+
 	// 1. Diagnostic Run
 	// Windows Puppet agent location varies, but usually in PATH.
 	// If not, use full path: '& "C:\Program Files\Puppet Labs\Puppet\bin\puppet.bat" agent -t'
@@ -385,28 +430,48 @@ func handleWindowsCheck(clientHost, caHost string) ResponseResult {
 		if err == nil && clientVersion != "" && clientVersion != config.PuppetVersion {
 			log.Printf("[%s] Version mismatch! Current: %s. Attempting to install MSI %s...", clientHost, clientVersion, config.PuppetVersion)
 
-			// Download MSI from Artifactory and install silently
+			// Download MSI from Artifactory and install silently.
+			// RunWithString executes via cmd.exe, so the script is passed to
+			// powershell -EncodedCommand (base64 UTF-16LE) rather than as raw
+			// PowerShell text — this avoids cmd.exe quoting issues with the
+			// embedded quotes/variables and matches how other Windows calls in
+			// this file invoke powershell explicitly.
+			// $ErrorActionPreference = 'Stop' makes Invoke-WebRequest throw (and thus
+			// return a nonzero exit code via runWindowsCommand) on a failed download,
+			// and the msiexec exit code is checked explicitly since Start-Process -Wait
+			// does not itself throw on a nonzero installer exit code.
 			// Note: Update the URL to match your exact Windows artifacts repository
-			upgradeCmd := fmt.Sprintf(`
-				$url = 'https://packages.gametools.dev/artifactory/tk2-systems-tools-windows/puppet-agent-%s-x64.msi';
-				$dest = 'C:\Windows\Temp\puppet_agent.msi';
-				Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing;
-				if (Test-Path $dest) {
-					Start-Process -FilePath 'msiexec.exe' -ArgumentList '/qn', '/i', $dest -Wait -NoNewWindow;
-					Remove-Item -Force $dest;
-				} else {
-					Write-Error 'Download failed'
+			upgradeScript := fmt.Sprintf(`
+				$ErrorActionPreference = 'Stop'
+				$url = 'https://packages.gametools.dev/artifactory/tk2-systems-tools-windows/puppet-agent-%s-x64.msi'
+				$dest = 'C:\Windows\Temp\puppet_agent.msi'
+				Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+				$proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/qn', '/i', $dest -Wait -NoNewWindow -PassThru
+				Remove-Item -Force $dest -ErrorAction SilentlyContinue
+				if ($proc.ExitCode -ne 0) {
+					Write-Error "msiexec failed with exit code $($proc.ExitCode)"
+					exit $proc.ExitCode
 				}
 			`, config.PuppetVersion)
+			encodedScript := base64.StdEncoding.EncodeToString(utf16leBytes(upgradeScript))
+			upgradeCmd := "powershell -NoProfile -NonInteractive -EncodedCommand " + encodedScript
 
 			_, installErr := runWindowsCommand(clientHost, upgradeCmd)
 
+			// Re-verify the installed version rather than trusting the install
+			// command's exit code alone.
+			postVerOut, postErr := runWindowsCommand(clientHost, "puppet --version")
+			postVersion := strings.TrimSpace(postVerOut)
+
 			if installErr != nil {
-				log.Printf("[%s] WARNING: Failed to maintain Puppet version: %v", clientHost, installErr)
-				result.Summary = "[Version fix failed]"
+				log.Printf("[%s] WARNING: Failed to install Puppet %s: %v", clientHost, config.PuppetVersion, installErr)
+				versionNote = "[Version fix failed] "
+			} else if postErr != nil || postVersion != config.PuppetVersion {
+				log.Printf("[%s] WARNING: Install command succeeded but version is still %q, expected %q", clientHost, postVersion, config.PuppetVersion)
+				versionNote = "[Version fix failed: post-install check mismatch] "
 			} else {
 				log.Printf("[%s] Successfully updated Puppet to %s", clientHost, config.PuppetVersion)
-				result.Summary = fmt.Sprintf("[Version enforced to %s] ", config.PuppetVersion)
+				versionNote = fmt.Sprintf("[Version enforced to %s] ", config.PuppetVersion)
 			}
 		} else if clientVersion == config.PuppetVersion {
 			log.Printf("[%s] Puppet version %s matches target state.", clientHost, clientVersion)
